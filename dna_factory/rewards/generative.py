@@ -112,10 +112,12 @@ def _parse_score(text: str):
     """Parse the judge's trailing 'Score: N' (0-10) and binarize at a fixed threshold of 7."""
     # Drop the judge's own thinking block, then expect a 'Score: N' line with N an integer 0-10.
     visible = text.rsplit("</think>", maxsplit=1)[-1]
-    match = re.search(r"Score:\s*(\d{1,2})", visible)
-    if match is None:
+    # The rubric asks for the score on the final line, so take the LAST match: a justification may
+    # mention an earlier "Score: N" while weighing alternatives.
+    matches = re.findall(r"Score:\s*(\d{1,2})", visible)
+    if not matches:
         return None
-    score = int(match.group(1))
+    score = int(matches[-1])
     if not 0 <= score <= 10:
         return None
     # Binarize to RLVR pass/fail: N >= 7 → 1.0, else 0.0
