@@ -12,7 +12,6 @@ is the single place for all training-loop-shared code.
 
 import argparse
 import logging
-import multiprocessing
 import os
 import sys
 import tomllib
@@ -277,6 +276,15 @@ def resolve_trust_remote_code(training_args):
     return bool(getattr(training_args, "trust_remote_code", False))
 
 
+def fill_dataset_num_proc(training_args):
+    """Default `dataset_num_proc` to half the usable CPUs, unless the user already set it.
+
+    `os.process_cpu_count` respects CPU affinity; the result is at least 1.
+    """
+    if training_args.dataset_num_proc is None:
+        training_args.dataset_num_proc = max(1, (os.process_cpu_count() or 1) // 2)
+
+
 def create_model_kwargs(model_args, training_args, dnotitia_args):
     """Create model initialization kwargs including quantization config."""
     model_kwargs = {
@@ -459,9 +467,9 @@ def run_training(
     if user_specified_args is None:
         user_specified_args = set()
 
-    # Set dataset number of processes to the number of CPUs
+    # Fill in dataset_num_proc only when the user (CLI/YAML) left it unset
     if spec.set_dataset_num_proc:
-        training_args.dataset_num_proc = multiprocessing.cpu_count() // 2
+        fill_dataset_num_proc(training_args)
 
     # Auto-generate output_dir if set to 'auto'
     auto_generated_dir = False
