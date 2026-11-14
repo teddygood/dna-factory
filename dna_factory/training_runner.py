@@ -430,6 +430,27 @@ class TrainingSpec:
     extra_trainer_kwargs: Callable | None = None  # -> dict merged into trainer kwargs
 
 
+def disable_liger_swiglu_for_parameter_lora(training_args, model_args, logger):
+    """Keep Liger's experts kernel off when LoRA targets the expert parameters (`lora_target_parameters`)."""
+    if not (
+        training_args.use_liger_kernel
+        and model_args.use_peft
+        and model_args.lora_target_parameters
+    ):
+        return
+    config = dict(training_args.liger_kernel_config or {})
+    if config.get("swiglu"):
+        raise ValueError(
+            "liger_kernel_config.swiglu=true cannot be combined with lora_target_parameters: "
+            "Liger's experts kernel bypasses the LoRA on the expert parameters."
+        )
+    logger.warning(
+        "lora_target_parameters is set: disabling Liger's swiglu kernel, which reads the raw expert "
+        "parameters and would bypass their LoRA. The other Liger kernels stay on."
+    )
+    training_args.liger_kernel_config = {**config, "swiglu": False}
+
+
 def _default(value, hook, *args):
     return hook(*args) if hook is not None else value
 
@@ -523,6 +544,8 @@ def run_training(
         prepare_training_args_for_unsloth(
             training_args, train_logger, model_type=ctx["unsloth_model_type"]
         )
+    else:
+        disable_liger_swiglu_for_parameter_lora(training_args, model_args, train_logger)
 
     # Method-specific training_args preparation (reward funcs, model_init_kwargs, ...)
     if spec.setup_training_args is not None:
