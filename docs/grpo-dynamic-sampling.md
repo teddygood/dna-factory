@@ -25,9 +25,18 @@ That holds when:
 
 - `beta: 0` — otherwise the row carries a KL term that truncation drops;
 - no entropy bonus and no router auxiliary loss — both put gradient on rows whose advantage is
-  zero.
+  zero;
+- `top_entropy_quantile: 1.0` — TRL pools token entropies across ranks for every micro-batch, so
+  a truncated dead micro-batch's stub entropies would shift the threshold and change which live
+  tokens get gradient.
 
-All three are detected at init and warned about; the run continues.
+Any of these under `mask` raises at init. Under `resample` the run continues, with truncation of
+dead micro-batches switched off (a short refill then costs its full forward).
+
+Regrouping dead rows into whole micro-batches (`per_device_train_batch_size > 1`) is skipped, with
+one log line at init, for `loss_type: bnpo`: its normalizer is the micro-batch's own token count,
+so moving rows between micro-batches reweights them. `grpo`, `sapo`, `dr_grpo`, `luspo`, `dapo`,
+`cispo` and `vespo` normalize per row or by a fixed scalar, so they are unaffected.
 
 The dapo normalizer is `inputs["num_items_in_batch"]`, a scalar fixed when the batch is scored,
 so truncating dead rows does not rescale the survivors. `resample` recomputes it for the
@@ -56,8 +65,9 @@ generated and scored, and its informative groups appended, until the local batch
 `dynamic_sampling_max_rounds` is hit. Filtering by group rather than by row matters when the
 reward has few distinct levels: a three-tier abstention group averaging exactly 0.5 gives its
 0.5 rows an advantage of 0, and a per-row filter would discard them from an otherwise useful
-group. When the local batch does not line up with group boundaries — detectable because
-group-normalized advantages sum to zero — it falls back to per-row. On the cap the original batch is used as-is; its dead rows
+group. A local batch that does not hold whole groups
+(`per_device_train_batch_size * steps_per_generation` not a multiple of `num_generations`) raises
+at init rather than falling back to per-row filtering, which would discard informative rows. On the cap the original batch is used as-is; its dead rows
 are then handled by the `mask` path. The loop exit is an all-reduce, since
 `_generate_and_score_completions` gathers internally and every rank must call it the same
 number of times.

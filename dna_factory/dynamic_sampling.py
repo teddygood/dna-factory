@@ -51,6 +51,10 @@ _COMPLETION_KEYS = (
     "ref_per_token_logps",
     "sampling_per_token_logps",
     "importance_sampling_ratio",
+    # (B, T, K) candidate token ids per completion token, padded with -1 on T and K. TRL reads it
+    # as `support_ids[:, -logits_to_keep:] = sampling_mask[start:end]`, so its dim 1 has to track
+    # the completion width; `t[:, :keep]` slices that axis and leaves K alone.
+    "sampling_mask",
 )
 # Keys whose second axis is neither the prompt nor the completion — image patches, or a mask
 # spanning prompt and completion at once. Slicing the completion axis would leave them at the
@@ -327,7 +331,13 @@ def concat_batches(
             and isinstance(vb, torch.Tensor)
             and va.dim() >= 1
         ):
-            if va.dim() >= 2 and vb.dim() >= 2 and va.shape[1] != vb.shape[1]:
+            if key == "sampling_mask" and va.dim() == 3 and vb.dim() == 3:
+                # TRL's layout: -1 padding on the right of both the token and candidate axes.
+                # K (candidates per token) varies between rounds with the sampler's top-k/top-p.
+                t_len = max(va.shape[1], vb.shape[1])
+                k_len = max(va.shape[2], vb.shape[2])
+                va, vb = _pad_mask(va, t_len, k_len), _pad_mask(vb, t_len, k_len)
+            elif va.dim() >= 2 and vb.dim() >= 2 and va.shape[1] != vb.shape[1]:
                 width = max(va.shape[1], vb.shape[1])
                 left = key in _PROMPT_KEYS
                 fill = pad_token_id if key == "prompt_ids" else 0
@@ -338,6 +348,13 @@ def concat_batches(
         else:
             out[key] = va
     return out
+
+
+def _pad_mask(t: torch.Tensor, t_len: int, k_len: int) -> torch.Tensor:
+    """Right-pad a (B, T, K) sampling mask to (B, t_len, k_len) with -1."""
+    return torch.nn.functional.pad(
+        t, (0, k_len - t.shape[2], 0, t_len - t.shape[1]), value=-1
+    )
 
 
 def _pad_to(t: torch.Tensor, width: int, value: int, left: bool) -> torch.Tensor:
@@ -366,6 +383,7 @@ class DynamicSamplingMixin:
         self._resample_iter = None
         self._truncation_is_lossless = True
         self._warned_regroup = False
+        self._regroup_is_neutral = True
         self._warned_short = False
         if self.dynamic_sampling != "off":
             logger.info(
@@ -383,13 +401,18 @@ class DynamicSamplingMixin:
                 extra.append("entropy bonus")
             if getattr(self, "aux_loss_enabled", False):
                 extra.append("router auxiliary loss")
+            if (getattr(self.args, "top_entropy_quantile", 1.0) or 1.0) < 1.0:
+                extra.append(f"top_entropy_quantile={self.args.top_entropy_quantile}")
             if extra and self.dynamic_sampling == "mask":
                 raise ValueError(
                     f"dynamic_sampling='mask' is incompatible with {', '.join(extra)}. `mask` "
                     f"rests on a dead row contributing exactly 0 to the loss, which holds for the "
                     f"policy term alone: beta * per_token_kl is added AFTER the advantage "
                     f"multiply, and the entropy and router terms do not go through the advantage "
-                    f"at all. A dead row still carries their gradient, so truncating it would drop "
+                    f"at all. top_entropy_quantile pools token entropies across ranks for every "
+                    f"micro-batch, so a truncated dead micro-batch feeds stub entropies into the "
+                    f"pool and moves the threshold that picks which live tokens get gradient. A "
+                    f"dead row still carries their gradient, so truncating it would drop "
                     f"that gradient on whatever fraction of the batch is dead. Use "
                     f"dynamic_sampling='resample', where every row surviving the refill keeps its "
                     f"full gradient, or set the terms above to zero."
@@ -398,6 +421,7 @@ class DynamicSamplingMixin:
             # and then it falls back to the original batch. Truncating there would drop the same
             # gradient `mask` was just refused for, so switch truncation off entirely instead.
             self._truncation_is_lossless = not extra
+            self._regroup_is_neutral = self._regroup_preserves_gradient()
             if extra:
                 logger.info(
                     "dynamic sampling 'resample' with %s: truncation of dead micro-batches is "
@@ -416,6 +440,41 @@ class DynamicSamplingMixin:
                 "dynamic_sampling='resample' does not support streaming datasets. "
                 "Use dynamic_sampling='mask', or load the dataset without streaming."
             )
+
+    def _regroup_preserves_gradient(self) -> bool:
+        """Is moving rows between micro-batches of one optimizer step gradient-neutral?
+
+        Per `_compute_loss` in TRL 1.17, by `loss_type`:
+          grpo, sapo  per-row mean over tokens, then mean over the micro-batch's rows. Row count
+                      is fixed, so each row's weight is 1/(rows * ga) wherever it sits. Safe.
+          dr_grpo     sum / (rows * max_completion_length), both constants. Safe.
+          luspo       per-row token sum, mean over rows. Safe.
+          dapo, cispo, vespo
+                      sum / `num_items_in_batch`, a scalar fixed at scoring time. Safe.
+          bnpo        sum / mask.sum() OF THE MICRO-BATCH, so a row's weight depends on which
+                      rows share its micro-batch. Regrouping reweights, so it is skipped.
+        Unknown loss types are treated as unsafe.
+        """
+        loss_type = getattr(self, "loss_type", None) or getattr(
+            self.args, "loss_type", None
+        )
+        safe = loss_type in (
+            "grpo",
+            "sapo",
+            "dr_grpo",
+            "luspo",
+            "dapo",
+            "cispo",
+            "vespo",
+        )
+        if not safe and self.args.per_device_train_batch_size > 1:
+            logger.info(
+                "dynamic sampling: loss_type=%r normalizes per micro-batch, so regrouping dead "
+                "rows would change the gradient; regrouping is disabled and truncation applies "
+                "only to micro-batches that happen to be all dead.",
+                loss_type,
+            )
+        return safe
 
     def _require_rank_batch_holds_whole_groups(self) -> None:
         """Refuse a configuration whose per-rank scored batch cannot be reshaped into groups.
@@ -599,7 +658,9 @@ class DynamicSamplingMixin:
         `loss_type='dapo'` its loss is `(per_token_loss * mask).sum() / num_items_in_batch` with a
         normalizer fixed at scoring time: a sum over exactly those rows, so permuting them inside
         the slice leaves the accumulated gradient identical. ('grpo' averages per row and divides
-        by ga, the same uniform average, so it is invariant too.)
+        by ga, the same uniform average, so it is invariant too. 'bnpo' is not: it divides by each
+        micro-batch's own token count, so `__init__` disables this method for it; see
+        `_regroup_preserves_gradient` for the verdict on every loss type.)
 
         Sorting across the WHOLE generation batch would not be. Dead rows would pile into the first
         slices and a step could come out entirely dead, taking an optimizer step on a zero gradient
@@ -656,6 +717,7 @@ class DynamicSamplingMixin:
             fresh
             and self.args.per_device_train_batch_size > 1
             and self._truncation_is_lossless
+            and self._regroup_is_neutral
         ) and self._regroup_dead_rows():
             # super() already handed back the pre-sort chunk; re-read the sorted one.
             inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
